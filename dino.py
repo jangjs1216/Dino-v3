@@ -1,9 +1,12 @@
+import argparse
+import glob
 import torch
 import torch.nn as nn
 from torchvision import transforms
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import matplotlib.pyplot as plt
 import os
+import numpy as np
 
 # ==========================================
 # 1. 설정 (Configuration)
@@ -61,79 +64,130 @@ inference_transform = transforms.Compose([
 # ==========================================
 # 4. 추론 및 시각화 함수
 # ==========================================
-def predict_and_visualize(img_path, model_path):
-    # --- A. 모델 초기화 및 가중치 로드 ---
+def load_model(model_path):
     if not os.path.exists(model_path):
-        print(f"Error: 모델 파일이 없습니다 -> {model_path}")
-        # (테스트를 위해 가중치 로드 없이 진행하려면 아래 줄 주석 처리)
-        return
+        raise FileNotFoundError(f"Model file not found: {model_path}")
 
     model = DinoSmallClassifier(NUM_CLASSES).to(DEVICE)
-    
-    # 학습된 가중치 덮어쓰기
     try:
         model.load_state_dict(torch.load(model_path, map_location=DEVICE))
         print("Model weights loaded successfully.")
     except Exception as e:
-        print(f"Warning: 가중치 로드 실패 (랜덤 가중치로 실행됩니다). \n에러: {e}")
+        print(f"Warning: 가중치 로드 실패 (랜덤 가중치로 실행됩니다). 에러: {e}")
 
-    model.eval() # 평가 모드 (Dropout 해제)
+    model.eval()
+    return model
 
-    # --- B. 이미지 로드 ---
-    if not os.path.exists(img_path):
-        print(f"Error: 이미지를 찾을 수 없습니다 -> {img_path}")
-        return
 
-    original_img = Image.open(img_path).convert('RGB')
-    
-    # 전처리 및 배치 차원 추가 (3, 640, 640) -> (1, 3, 640, 640)
-    input_tensor = inference_transform(original_img).unsqueeze(0).to(DEVICE)
-
-    # --- C. 추론 진행 ---
-    print(f"Inferencing with resolution 640x640 on {DEVICE}...")
-    
+def predict_image(model, pil_image):
+    input_tensor = inference_transform(pil_image).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
         outputs = model(input_tensor)
         probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
-        
-        # Top 1 예측 결과
         top_prob, top_idx = torch.max(probabilities, 0)
         pred_class = CLASS_NAMES[top_idx.item()]
         confidence = top_prob.item() * 100
 
-    # --- D. 시각화 (Matplotlib) ---
-    plt.figure(figsize=(12, 8))
-    
-    # 원본 이미지 표시
-    plt.imshow(original_img)
-    plt.axis('off')
-    
-    # 결과 텍스트 오버레이
-    result_text = f"Pred: {pred_class}\nConf: {confidence:.2f}%"
-    
-    # 텍스트 박스 스타일 설정
-    bbox_props = dict(boxstyle="round,pad=0.5", fc="white", ec="gray", alpha=0.8)
-    
-    # 이미지 좌측 상단에 결과 표시
-    plt.text(10, 50, result_text, fontsize=20, color='darkblue', 
-             fontweight='bold', bbox=bbox_props, verticalalignment='top')
+    return pred_class, confidence
 
-    # 타이틀
-    plt.title(f"DINO ViT-S/16 (Distilled) Inference Result", fontsize=15)
-    
-    plt.tight_layout()
-    plt.show()
-    
-    print(f"\n>>> 최종 예측: {pred_class} ({confidence:.2f}%)")
+
+def annotate_image(pil_image, text):
+    # PIL로 텍스트 오버레이 (폰트 없을 경우 기본 폰트 사용)
+    img = pil_image.copy()
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", size=28)
+    except Exception:
+        font = ImageFont.load_default()
+
+    # 텍스트 위치 및 배경 박스
+    margin = 10
+    lines = text.split('\n')
+    max_w = 0
+    total_h = 0
+    for line in lines:
+        w, h = draw.textsize(line, font=font)
+        max_w = max(max_w, w)
+        total_h += h
+
+    box_w = max_w + margin * 2
+    box_h = total_h + margin * 2
+
+    # 반투명 박스
+    box = Image.new('RGBA', (box_w, box_h), (255, 255, 255, 200))
+    img.paste(box, (10, 10), box)
+
+    # 텍스트 그리기
+    y = 10 + margin
+    for line in lines:
+        draw.text((10 + margin, y), line, fill='black', font=font)
+        y += font.getsize(line)[1]
+
+    return img
+
+
+def save_side_by_side(original, annotated, out_path):
+    w, h = original.size
+    canvas = Image.new('RGB', (w * 2, h))
+    canvas.paste(original, (0, 0))
+    canvas.paste(annotated, (w, 0))
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    canvas.save(out_path)
+
+
+def process_folder(model, folder_path, out_dir, show_each=False, max_images=None):
+    png_paths = sorted(glob.glob(os.path.join(folder_path, '*.png')))
+    if not png_paths:
+        print(f"No PNG images found in {folder_path}")
+        return
+
+    for i, p in enumerate(png_paths):
+        if max_images and i >= max_images:
+            break
+
+        img = Image.open(p).convert('RGB')
+        pred_class, conf = predict_image(model, img)
+        text = f"Pred: {pred_class}\nConf: {conf:.2f}%"
+        annotated = annotate_image(img, text)
+
+        base = os.path.basename(p)
+        out_path = os.path.join(out_dir, base)
+        save_side_by_side(img, annotated, out_path)
+        print(f"Saved: {out_path}")
+
+        if show_each:
+            plt.figure(figsize=(8, 6))
+            plt.imshow(np.array(Image.open(out_path)))
+            plt.axis('off')
+            plt.title(base)
+            plt.show()
 
 # ==========================================
 # 실행
 # ==========================================
 if __name__ == '__main__':
-    # 1. 먼저 테스트용 가짜 모델 파일을 만들거나, 실제 파일 경로를 지정하세요.
-    # predict_and_visualize(TEST_IMAGE_PATH, MODEL_PATH)
-    
-    # [참고] 모델 파일이 없을 때 테스트를 위해 모델만 로드해보는 코드:
-    print("모델 다운로드 및 구조 테스트 중...")
-    temp_model = DinoSmallClassifier(NUM_CLASSES)
-    print("성공! 위 구조대로 학습된 .pth 파일만 있으면 됩니다.")
+    parser = argparse.ArgumentParser(description='Run local inference with a DINO model and show original+result side-by-side.')
+    parser.add_argument('--model', '-m', required=True, help='Path to local .pth/.pt model file')
+    parser.add_argument('--folders', '-f', required=True, nargs='+', help='One or more folders containing 640x640 PNG images')
+    parser.add_argument('--outdir', '-o', default='outputs', help='Directory to save side-by-side results')
+    parser.add_argument('--show', action='store_true', help='Show each result with matplotlib')
+    parser.add_argument('--max', type=int, default=None, help='Max images per folder to process')
+    args = parser.parse_args()
+
+    try:
+        model = load_model(args.model)
+    except FileNotFoundError as e:
+        print(e)
+        raise SystemExit(1)
+
+    for folder in args.folders:
+        if not os.path.isdir(folder):
+            print(f"Warning: 폴더가 아닙니다 -> {folder} (건너뜀)")
+            continue
+
+        folder_name = os.path.basename(os.path.normpath(folder))
+        target_out = os.path.join(args.outdir, folder_name)
+        print(f"Processing folder: {folder} -> {target_out}")
+        process_folder(model, folder, target_out, show_each=args.show, max_images=args.max)
+
+    print("모두 완료되었습니다. 출력 폴더를 확인하세요.")
