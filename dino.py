@@ -206,8 +206,16 @@ class FeatureDatabase:
                 img_path = self.image_paths[found_img_idx]
                 
                 # Filter: Skip if it's the same image as the query
-                if current_image_path and os.path.abspath(img_path) == os.path.abspath(current_image_path):
-                    continue
+                # Use strict normalization or just basename if paths are messy
+                # Debugging print (comment out later)
+                # print(f"Comparing {img_path} vs {current_image_path}")
+                
+                if current_image_path:
+                    # Normalize both
+                    p1 = os.path.normpath(os.path.abspath(img_path))
+                    p2 = os.path.normpath(os.path.abspath(current_image_path))
+                    if p1 == p2:
+                        continue
 
                 # Calculate row/col
                 grid_rows = self.metadata[found_img_idx]['grid_size'][0] 
