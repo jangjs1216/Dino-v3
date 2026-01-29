@@ -141,7 +141,7 @@ class FeatureDatabase:
         self.metadata.append({'grid_size': grid_size})
 
     def build_flattened_index(self):
-        # Concatenate all features for fast matrix search
+        # Concatenate all features for global PCA
         if not self.features:
             print("Database is empty.")
             return None
@@ -154,42 +154,61 @@ class FeatureDatabase:
             self.global_index_map.append((start_idx, count))
             start_idx += count
             
-        self.flattened_features = torch.cat(self.features, dim=0) # (Total_Patches, 384)
-        # Normalize for Cosine Similarity: A . B / |A||B|
-        # Pre-normalize database vectors
-        self.flattened_features = F.normalize(self.flattened_features, p=2, dim=1)
-        print(f"Database built: {len(self.image_paths)} images, {self.flattened_features.shape[0]} total patches.")
+        all_features = torch.cat(self.features, dim=0) # (Total_Patches, 384)
+        
+        # --- Perform PCA to reduce to 3 dimensions ---
+        print(f"Applying PCA (384 -> 3) on {all_features.shape[0]} patches...")
+        
+        # Center the data
+        mean = all_features.mean(dim=0)
+        centered_features = all_features - mean
+        
+        # Compute PCA using SVD
+        # We want the top 3 principal components
+        try:
+            # torch.pca_lowrank is efficient
+            U, S, V = torch.pca_lowrank(centered_features, q=3, center=False, niter=2)
+            # Project data: (N, 384) @ (384, 3) -> (N, 3)
+            self.flattened_features = torch.matmul(centered_features, V[:, :3])
+        except Exception as e:
+            print(f"PCA failed: {e}. Fallback to random projection.")
+            self.flattened_features = torch.randn(all_features.shape[0], 3)
+            
+        print(f"Database built: {len(self.image_paths)} images, {self.flattened_features.shape[0]} total patches (3D).")
+
+        # Update self.features list to store the 3D versions for easy access per image
+        new_features_list = []
+        idx = 0
+        for count in self.patch_counts:
+            new_features_list.append(self.flattened_features[idx : idx+count])
+            idx += count
+        self.features = new_features_list
 
     def search(self, query_vector, current_image_path=None, top_k=5):
-        # query_vector: (384,) or (1, 384)
+        # query_vector: (3,)
         if hasattr(self, 'flattened_features') is False:
             self.build_flattened_index()
             
         if query_vector.dim() == 1:
-            query_vector = query_vector.unsqueeze(0)
+            query_vector = query_vector.unsqueeze(0) # (1, 3)
             
-        # Normalize query
-        query_vector = F.normalize(query_vector, p=2, dim=1)
+        # Euclidean distance
+        # dists: (Total,)
+        dists = torch.cdist(query_vector, self.flattened_features, p=2).squeeze(0)
         
-        # Cosine similarity
-        # (1, 384) @ (384, Total) -> (1, Total)
-        scores = torch.mm(query_vector, self.flattened_features.t())
-        scores = scores.squeeze(0)
-        
-        # We need more than top_k candidates because we might filter some out (self-matches)
-        # Safe bet: fetch top_k * 3 or all if small
-        n_candidates = min(top_k * 10, scores.shape[0])
-        top_scores, top_indices = torch.topk(scores, n_candidates)
+        # We want the smallest distance
+        n_candidates = min(top_k * 10, dists.shape[0])
+        top_dists, top_indices = torch.topk(dists, n_candidates, largest=False)
         
         results = []
         found_count = 0
         
-        for score, global_idx in zip(top_scores, top_indices):
+        for dist, global_idx in zip(top_dists, top_indices):
             if found_count >= top_k:
                 break
                 
             global_idx = global_idx.item()
-            score = score.item()
+            dist = dist.item()
             
             # Find which image this belongs to
             found_img_idx = -1
@@ -206,10 +225,6 @@ class FeatureDatabase:
                 img_path = self.image_paths[found_img_idx]
                 
                 # Filter: Skip if it's the same image as the query
-                # Use strict normalization or just basename if paths are messy
-                # Debugging print (comment out later)
-                # print(f"Comparing {img_path} vs {current_image_path}")
-                
                 if current_image_path:
                     # Normalize both
                     p1 = os.path.normpath(os.path.abspath(img_path))
@@ -228,7 +243,7 @@ class FeatureDatabase:
                 
                 results.append({
                     'image_path': img_path,
-                    'score': score,
+                    'score': dist,
                     'patch_row': row,
                     'patch_col': col,
                     'grid_size': (grid_rows, grid_cols),
