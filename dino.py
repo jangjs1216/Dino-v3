@@ -184,7 +184,7 @@ class FeatureDatabase:
             idx += count
         self.features = new_features_list
 
-    def search(self, query_vector, current_image_path=None, top_k=5):
+    def search(self, query_vector, exclude_global_idx=None, top_k=5):
         # query_vector: (3,)
         if hasattr(self, 'flattened_features') is False:
             self.build_flattened_index()
@@ -209,6 +209,10 @@ class FeatureDatabase:
                 
             global_idx = global_idx.item()
             dist = dist.item()
+
+            # Filter: Skip specific excluded index (self-match)
+            if exclude_global_idx is not None and global_idx == exclude_global_idx:
+                continue
             
             # Find which image this belongs to
             found_img_idx = -1
@@ -223,14 +227,7 @@ class FeatureDatabase:
             
             if found_img_idx != -1:
                 img_path = self.image_paths[found_img_idx]
-                
-                # Filter: Skip if it's the same image as the query
-                if current_image_path:
-                    # Normalize both
-                    p1 = os.path.normpath(os.path.abspath(img_path))
-                    p2 = os.path.normpath(os.path.abspath(current_image_path))
-                    if p1 == p2:
-                        continue
+
 
                 # Calculate row/col
                 grid_rows = self.metadata[found_img_idx]['grid_size'][0] 
@@ -397,9 +394,12 @@ def interactive_search_session(db, model, transform, top_k=5):
             print(f"Selecting Feature Grid ({grid_row}, {grid_col})")
             
         if target_vector is not None:
-            # Search excluding current image
-            current_path = db.image_paths[current_img_idx]
-            results = db.search(target_vector, current_image_path=current_path, top_k=top_k)
+            # Calculate global index of the query to exclude it precisely
+            # db.global_index_map[img_idx] -> (start, count)
+            start_global_idx, _ = db.global_index_map[current_img_idx]
+            query_global_idx = start_global_idx + feature_idx
+            
+            results = db.search(target_vector, exclude_global_idx=query_global_idx, top_k=top_k)
             show_results(results, (x, y))
 
     def show_results(results, query_xy):
