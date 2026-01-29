@@ -24,10 +24,6 @@ class CustomLinear(nn.Linear):
         self.register_buffer('bias_mask', torch.ones(out_features))
 
     def forward(self, input):
-        # Assuming bias_mask modifies bias or output? 
-        # For simple inference loading, we'll use standard linear behavior
-        # unless bias_mask is intended to zero out bias.
-        # But we must have the attribute to load state_dict.
         return F.linear(input, self.weight, self.bias)
 
 class Attention(nn.Module):
@@ -36,8 +32,6 @@ class Attention(nn.Module):
         self.num_heads = num_heads
         head_dim = dim // num_heads
         self.scale = head_dim ** -0.5
-
-        # Inspecting keys: blocks.0.attn.qkv.weight, blocks.0.attn.qkv.bias_mask
         self.qkv = CustomLinear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim)
 
@@ -45,13 +39,10 @@ class Attention(nn.Module):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]
-
         if rope is not None:
              q, k = rope(q, k)
-
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
-
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         return x
@@ -77,10 +68,8 @@ class Block(nn.Module):
         self.norm1 = nn.LayerNorm(dim)
         self.attn = Attention(dim, num_heads)
         self.ls1 = LayerScale(dim, init_values=init_values)
-        
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = Mlp(dim, int(dim * mlp_ratio))
-        # Assuming ls2 exists based on ls1 presence in standard layer scale utils
         self.ls2 = LayerScale(dim, init_values=init_values)
 
     def forward(self, x, rope=None):
@@ -91,30 +80,21 @@ class Block(nn.Module):
 class RoPE(nn.Module):
     def __init__(self, dim):
         super().__init__()
-        # Creating a parameter to match 'rope_embed.periods'
-        # Shape was [16] in inspection. 
         self.periods = nn.Parameter(torch.zeros(16)) 
 
     def forward(self, q, k):
-        # Placeholder for RoPE logic. 
-        # Without exact freq logic, we just return q, k.
-        # This allows loading state dict without error.
-        # Implementing incorrect RoPE would degrade performance, 
-        # but loading is primary here.
         return q, k
 
 class DinoV3(nn.Module):
     def __init__(self, img_size=224, patch_size=16, in_chans=3, 
                  embed_dim=384, depth=12, num_heads=6, mlp_ratio=4.):
         super().__init__()
-        
         self.patch_embed = nn.Module()
-        # patch_embed.proj.weight, patch_embed.proj.bias
         self.patch_embed.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
         
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.mask_token = nn.Parameter(torch.zeros(1, embed_dim))
-        self.storage_tokens = nn.Parameter(torch.zeros(1, 4, embed_dim)) # 4 storage tokens
+        self.storage_tokens = nn.Parameter(torch.zeros(1, 4, embed_dim))
         
         self.rope_embed = RoPE(embed_dim)
         
@@ -126,14 +106,12 @@ class DinoV3(nn.Module):
         self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x):
-        # x: B, C, H, W
         x = self.patch_embed.proj(x)
         B, C, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2) # B, N, C
+        x = x.flatten(2).transpose(1, 2)
         
         cls_tokens = self.cls_token.expand(B, -1, -1)
         storage_tokens = self.storage_tokens.expand(B, -1, -1)
-        
         x = torch.cat((cls_tokens, storage_tokens, x), dim=1)
         
         for blk in self.blocks:
@@ -142,37 +120,122 @@ class DinoV3(nn.Module):
         x = self.norm(x)
         return x
 
+# --- Feature Database & Search Logic ---
+
+class FeatureDatabase:
+    def __init__(self):
+        self.features = [] # List of (N, 384) tensors
+        self.image_paths = []
+        self.patch_counts = [] # Number of patches (N) per image
+        self.metadata = [] # List of dicts with 'grid_size': (rows, cols)
+
+    def add_image(self, img_path, features, grid_size):
+        # features: (1, N_tokens, 384) - we want to store relevant tokens
+        # Remove CLS (0) and Storage (1-4). Keep 5:
+        # features shape after slice: (N_patches, 384)
+        patch_features = features[0, 5:, :].cpu()
+        
+        self.features.append(patch_features)
+        self.image_paths.append(img_path)
+        self.patch_counts.append(patch_features.shape[0])
+        self.metadata.append({'grid_size': grid_size})
+
+    def build_flattened_index(self):
+        # Concatenate all features for fast matrix search
+        if not self.features:
+            print("Database is empty.")
+            return None
+        
+        # Keep track of which global index belongs to which image
+        self.global_index_map = []
+        start_idx = 0
+        for i, count in enumerate(self.patch_counts):
+            # Range [start_idx, start_idx + count) belongs to image i
+            self.global_index_map.append((start_idx, count))
+            start_idx += count
+            
+        self.flattened_features = torch.cat(self.features, dim=0) # (Total_Patches, 384)
+        # Normalize for Cosine Similarity: A . B / |A||B|
+        # Pre-normalize database vectors
+        self.flattened_features = F.normalize(self.flattened_features, p=2, dim=1)
+        print(f"Database built: {len(self.image_paths)} images, {self.flattened_features.shape[0]} total patches.")
+
+    def search(self, query_vector, current_image_path=None, top_k=5):
+        # query_vector: (384,) or (1, 384)
+        if hasattr(self, 'flattened_features') is False:
+            self.build_flattened_index()
+            
+        if query_vector.dim() == 1:
+            query_vector = query_vector.unsqueeze(0)
+            
+        # Normalize query
+        query_vector = F.normalize(query_vector, p=2, dim=1)
+        
+        # Cosine similarity
+        # (1, 384) @ (384, Total) -> (1, Total)
+        scores = torch.mm(query_vector, self.flattened_features.t())
+        scores = scores.squeeze(0)
+        
+        # We need more than top_k candidates because we might filter some out (self-matches)
+        # Safe bet: fetch top_k * 3 or all if small
+        n_candidates = min(top_k * 10, scores.shape[0])
+        top_scores, top_indices = torch.topk(scores, n_candidates)
+        
+        results = []
+        found_count = 0
+        
+        for score, global_idx in zip(top_scores, top_indices):
+            if found_count >= top_k:
+                break
+                
+            global_idx = global_idx.item()
+            score = score.item()
+            
+            # Find which image this belongs to
+            found_img_idx = -1
+            local_idx = -1
+            
+            # Binary search or simple linear scan
+            for img_idx, (start, count) in enumerate(self.global_index_map):
+                if start <= global_idx < start + count:
+                    found_img_idx = img_idx
+                    local_idx = global_idx - start
+                    break
+            
+            if found_img_idx != -1:
+                img_path = self.image_paths[found_img_idx]
+                
+                # Filter: Skip if it's the same image as the query
+                if current_image_path and os.path.abspath(img_path) == os.path.abspath(current_image_path):
+                    continue
+
+                # Calculate row/col
+                grid_rows = self.metadata[found_img_idx]['grid_size'][0] 
+                grid_cols = self.metadata[found_img_idx]['grid_size'][1] 
+                
+                row = local_idx // grid_cols
+                col = local_idx % grid_cols
+                
+                patch_box = self.metadata[found_img_idx].get('patch_box')
+                
+                results.append({
+                    'image_path': img_path,
+                    'score': score,
+                    'patch_row': row,
+                    'patch_col': col,
+                    'grid_size': (grid_rows, grid_cols),
+                    'patch_box': patch_box
+                })
+                found_count += 1
+                
+        return results
+
 # --- Helper Functions ---
 
-def split_image(image_path, patch_h, patch_w):
-    img = Image.open(image_path).convert('RGB')
+def split_image_with_coords(img, patch_h, patch_w):
     w, h = img.size
-    
     patches = []
-    
-    # Calculate stepping. If image is smaller than patch size, we just take one crop (or resize? assuming input >= patch_size)
-    # If we want to cover the whole image.
-    
-    # Logic: simple grid. If (j + patch_w) > w, shift j back so that box ends at w.
-    # Same for i.
-    
-    # Generate start coordinates
-    y_starts = list(range(0, h, patch_h))
-    if y_starts[-1] + patch_h > h:
-        # If the last regular step goes out of bounds, 
-        # we still want to cover the end. 
-        # However, the user wants "naturally cut into the image" -> shift the last patch.
-        # But simply adding the shifted patch might duplicate content.
-        # Let's check common logic: Sliding window with stride = patch_size.
-        # If last window > h, we make the last window start at h - patch_h.
-        pass
-
-    # Actually, a simpler loop approach:
-    # Iterate with stride, but if we exceed, we clamp the start.
-    
-    # Correct approach for strictly "covering" without padding:
-    # 1. 0, patch_h, 2*patch_h ... 
-    # 2. If current + patch_h > h, then current = h - patch_h. And stop after this.
+    coords = [] # (left, top, right, bottom)
     
     i = 0
     while i < h:
@@ -181,7 +244,7 @@ def split_image(image_path, patch_h, patch_w):
         if bottom > h:
             bottom = h
             top = h - patch_h
-            if top < 0: top = 0 # Handle image smaller than patch
+            if top < 0: top = 0
         
         j = 0
         while j < w:
@@ -194,179 +257,225 @@ def split_image(image_path, patch_h, patch_w):
             
             box = (left, top, right, bottom)
             crop = img.crop(box)
-            
-            # Helper to resize if image is smaller than patch size (rare edge case)
             if crop.size != (patch_w, patch_h):
                  crop = crop.resize((patch_w, patch_h), Image.BICUBIC)
             
             patches.append(crop)
+            coords.append(box)
             
-            if right == w:
-                break
+            if right == w: break
             j += patch_w
-        
-        if bottom == h:
-            break
+        if bottom == h: break
         i += patch_h
+        
+    return patches, coords
+
+def interactive_search_session(db, model, transform, top_k=5):
+    import matplotlib
+    try:
+        matplotlib.use('Qt5Agg')
+    except Exception:
+        pass
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Rectangle
+    
+    if not db.image_paths:
+        print("No images in database.")
+        return
+
+    # Helper: Load image and setup plot
+    current_img_idx = 0
+    fig, ax = plt.subplots(figsize=(10, 10))
+    plt.subplots_adjust(bottom=0.2)
+    
+    img_data = {'patches': [], 'coords': [], 'features': None}
+    
+    def load_current_image():
+        ax.clear()
+        img_path = db.image_paths[current_img_idx]
+        img = Image.open(img_path).convert('RGB')
+        ax.imshow(img)
+        ax.set_title(f"Click on a defect! [{current_img_idx+1}/{len(db.image_paths)}] {os.path.basename(img_path)}")
+        ax.axis('off')
+        
+        # We need patch coords and features.
+        # DB features are stored by linear index in self.flattened, or by lists in self.features.
+        # self.features[idx] corresponds to the idx-th entry in DB.
+        # In process_and_build_db, each entry is ONE 640x640 patch.
+        # But here we are loading the FULL image file.
+        # If the image was split into multiple patches in DB, we have multiple DB entries for one file.
+        # This complicates "load_current_image" if we want to show the full image and let user click anywhere.
+        
+        # Simplified approach: Treat each DB entry (640x640 patch) as a separate "image" to browse.
+        # So "current_img_idx" iterates over DB entries (patches).
+        # We visualize the crop.
+        
+        # If the user wants to see the full image and click, we'd need to stitch.
+        # Given "640x640 이미지에서 유저가 특정 불량 지점을 선택하면", let's stick to showing the 640x640 patch.
+        
+        patch_box = db.metadata[current_img_idx].get('patch_box')
+        # Load full image then crop to patch_box
+        full_img = Image.open(img_path).convert('RGB')
+        # crop
+        patch_img = full_img.crop(patch_box)
+        
+        ax.clear()
+        ax.imshow(patch_img)
+        ax.set_title(f"Entry {current_img_idx}: {os.path.basename(img_path)}")
+        ax.axis('off')
+
+        img_data['features'] = db.features[current_img_idx] # (1600, 384)
+        plt.draw()
+
+    load_current_image()
+    
+    # Navigation Buttons
+    from matplotlib.widgets import Button
+    axprev = plt.axes([0.3, 0.05, 0.1, 0.075])
+    axnext = plt.axes([0.6, 0.05, 0.1, 0.075])
+    bnext = Button(axnext, 'Next')
+    bprev = Button(axprev, 'Prev')
+
+    def next_img(event):
+        nonlocal current_img_idx
+        current_img_idx = (current_img_idx + 1) % len(db.image_paths)
+        load_current_image()
+
+    def prev_img(event):
+        nonlocal current_img_idx
+        current_img_idx = (current_img_idx - 1) % len(db.image_paths)
+        load_current_image()
+
+    bnext.on_clicked(next_img)
+    bprev.on_clicked(prev_img)
+
+    def on_click(event):
+        if event.inaxes != ax: return
+        x, y = int(event.xdata), int(event.ydata)
+        print(f"Clicked at: {x}, {y}")
+        
+        # Visual Feedback
+        [p.remove() for p in ax.patches if not hasattr(p, 'is_result_box')]
+        ax.plot(x, y, 'rx', markersize=10)
+        
+        # Map pixel to feature index (40x40 grid)
+        # 640 / 40 = 16 pixels per block
+        grid_row = int(y / 16)
+        grid_col = int(x / 16)
+        
+        if grid_row >= 40: grid_row = 39
+        if grid_col >= 40: grid_col = 39
+        
+        feature_idx = grid_row * 40 + grid_col
+        
+        target_vector = None
+        if feature_idx < img_data['features'].shape[0]:
+            target_vector = img_data['features'][feature_idx]
+            print(f"Selecting Feature Grid ({grid_row}, {grid_col})")
             
-    return patches
+        if target_vector is not None:
+            # Search excluding current image
+            current_path = db.image_paths[current_img_idx]
+            results = db.search(target_vector, current_image_path=current_path, top_k=top_k)
+            show_results(results, (x, y))
+
+    def show_results(results, query_xy):
+        if not results:
+            print("No matches found (other than source).")
+            return
+            
+        n_results = len(results)
+        res_fig, res_axes = plt.subplots(1, n_results, figsize=(3 * n_results, 5))
+        
+        # Handle singleton axis if n_results = 1
+        if n_results == 1:
+            res_axes = [res_axes]
+            
+        for k, res in enumerate(results):
+            ax_k = res_axes[k]
+            
+            r_path = res['image_path']
+            r_score = res['score']
+            p_box = res['patch_box'] # (left, top, right, bottom) in original image
+            
+            full_img = Image.open(r_path).convert('RGB')
+            patch_img = full_img.crop(p_box)
+            
+            ax_k.imshow(patch_img)
+            ax_k.set_title(f"{r_score:.3f}\n{os.path.basename(r_path)}")
+            ax_k.axis('off')
+            
+            # Draw Red Box around the specific 16x16 feature block
+            r_row = res['patch_row']
+            r_col = res['patch_col']
+            
+            # 1 feature = 16x16 pixels
+            rect_x = r_col * 16
+            rect_y = r_row * 16
+            
+            rect = Rectangle((rect_x, rect_y), 16, 16, linewidth=2, edgecolor='red', facecolor='none')
+            ax_k.add_patch(rect)
+            
+        res_fig.show()
+
+    fig.canvas.mpl_connect('button_press_event', on_click)
+    plt.show()
+
+def process_and_build_db(input_folder, model, transform):
+    db = FeatureDatabase()
+    image_files = glob.glob(os.path.join(input_folder, "*.jpg")) + \
+                  glob.glob(os.path.join(input_folder, "*.png"))
+    
+    print(f"Building database from {len(image_files)} image files...")
+    
+    for img_path in image_files:
+        img = Image.open(img_path).convert('RGB')
+        patches, coords = split_image_with_coords(img, 640, 640)
+        
+        for i, (patch, box) in enumerate(zip(patches, coords)):
+            input_tensor = transform(patch).unsqueeze(0)
+            with torch.no_grad():
+                output = model(input_tensor) # (1, 1605, 384)
+            
+            db.add_image(
+                img_path, 
+                output, 
+                grid_size=(40, 40)
+            )
+            db.metadata[-1]['patch_box'] = box
+            db.metadata[-1]['patch_index'] = i
+
+    db.build_flattened_index()
+    return db
 
 def main():
     pth_file = 'dinov3_vits16_pretrain_lvd1689m-08c60483.pth'
-    
-    # Find images
-    image_extensions = ['*.jpg', '*.jpeg', '*.png']
-    image_files = []
-    for ext in image_extensions:
-        image_files.extend(glob.glob(ext))
-        
-    if not image_files:
-        print("No images found in directory.")
+    if not os.path.exists(pth_file):
+        print(f"Model file {pth_file} not found.")
         return
 
-    print(f"Found images: {image_files}")
-    
-    # Initialize model
     model = DinoV3(embed_dim=384, depth=12, num_heads=6)
-    
-    print(f"Loading weights from {pth_file}...")
     try:
         state_dict = torch.load(pth_file, map_location='cpu')
-        
-        # Handle 'state_dict' key if present (not in this case based on inspection)
-        if 'state_dict' in state_dict:
-            state_dict = state_dict['state_dict']
-            
-        # Helper to strict=False loading with basic checking
-        msg = model.load_state_dict(state_dict, strict=False)
-        print(f"Load message: {msg}")
-        
+        if 'state_dict' in state_dict: state_dict = state_dict['state_dict']
+        model.load_state_dict(state_dict, strict=False)
+        model.eval()
     except Exception as e:
         print(f"Failed to load weights: {e}")
         return
 
-    model.eval()
-    
     transform = transforms.Compose([
-        transforms.Resize((640, 640)), # Ensure patches are exactly 640x640 if coming from split?
-        # Actually split_image returns 640x640 PIL images already.
+        transforms.Resize((640, 640)), 
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-
-    # ... (previous code)
-
-    try:
-        from sklearn.decomposition import PCA
-        import matplotlib.pyplot as plt
-        import numpy as np
-    except ImportError:
-        print("Please install scikit-learn and matplotlib to visualize results.")
-        return
-
-    def visualize_result(patch_img_tensor, output_tensor, patch_idx, output_folder, file_basename):
-        # ... (same logic, but save to output_folder)
-        features = output_tensor[0, 5:, :] 
-        n_tokens = features.shape[0]
-        side = int(math.sqrt(n_tokens))
+    
+    print("Building Database...")
+    db = process_and_build_db('.', model, transform)
         
-        features = features.cpu().numpy()
-        pca = PCA(n_components=3)
-        pca_features = pca.fit_transform(features)
-        pca_features = (pca_features - pca_features.min(0)) / (pca_features.max(0) - pca_features.min(0))
-        pca_img = pca_features.reshape(side, side, 3)
-        
-        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
-        img = patch_img_tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
-        mean = np.array([0.485, 0.456, 0.406])
-        std = np.array([0.229, 0.224, 0.225])
-        img = std * img + mean
-        img = np.clip(img, 0, 1)
-        
-        axes[0].imshow(img)
-        axes[0].set_title(f"Original Patch {patch_idx}")
-        axes[0].axis('off')
-        
-        axes[1].imshow(pca_img)
-        axes[1].set_title(f"PCA Features {patch_idx}")
-        axes[1].axis('off')
-        
-        output_filename = os.path.join(output_folder, f"{file_basename}_patch_{patch_idx}_pca.png")
-        plt.tight_layout()
-        plt.savefig(output_filename)
-        plt.close(fig)
-        print(f"  Saved visualization to {output_filename}")
-
-    def visualize_full_channels(output_tensor, patch_idx, output_folder, file_basename):
-        features = output_tensor[0, 5:, :] 
-        n_tokens = features.shape[0]
-        side = int(math.sqrt(n_tokens))
-        n_channels = features.shape[1]
-
-        cols = 24
-        rows = int(math.ceil(n_channels / cols))
-        
-        features = features.reshape(side, side, n_channels).permute(2, 0, 1).cpu().numpy()
-        canvas = np.zeros((rows * side, cols * side))
-        
-        for i in range(n_channels):
-            r = i // cols
-            c = i % cols
-            ch_img = features[i]
-            dmin, dmax = ch_img.min(), ch_img.max()
-            if dmax - dmin > 1e-6:
-                ch_img = (ch_img - dmin) / (dmax - dmin)
-            else:
-                ch_img = np.zeros_like(ch_img)
-            canvas[r*side:(r+1)*side, c*side:(c+1)*side] = ch_img
-
-        plt.figure(figsize=(24, 16))
-        plt.imshow(canvas, cmap='viridis')
-        plt.title(f"All {n_channels} Channels for Patch {patch_idx}")
-        plt.axis('off')
-        plt.tight_layout()
-        
-        out_name = os.path.join(output_folder, f"{file_basename}_patch_{patch_idx}_all_channels.png")
-        plt.savefig(out_name, dpi=150)
-        plt.close()
-        print(f"  Saved full channel grid to {out_name}")
-
-    def process_images_in_folder(input_folder, output_folder, model, transform):
-        if not os.path.exists(output_folder):
-            os.makedirs(output_folder)
-            
-        image_extensions = ['*.jpg', '*.jpeg', '*.png']
-        image_files = []
-        for ext in image_extensions:
-            # Recursive or simple? Glob in python doesn't do recursive by default unless ** and recursive=True
-            image_files.extend(glob.glob(os.path.join(input_folder, ext)))
-            
-        if not image_files:
-            print(f"No images found in {input_folder}")
-            return
-
-        for img_path in image_files:
-            file_basename = os.path.splitext(os.path.basename(img_path))[0]
-            print(f"\nProcessing {img_path}...")
-            
-            # Use 640x640 splitting logic
-            patches = split_image(img_path, 640, 640)
-            print(f"Split into {len(patches)} patches of 640x640.")
-            
-            for i, patch in enumerate(patches):
-                input_tensor = transform(patch).unsqueeze(0)
-                
-                with torch.no_grad():
-                    output = model(input_tensor)
-                    
-                print(f"  Patch {i}: Output shape {output.shape}")
-                visualize_result(input_tensor, output, i, output_folder, file_basename)
-                visualize_full_channels(output, i, output_folder, file_basename)
-
-    # Call the processing function
-    # Current directory as input, 'output_vis' as output
-    process_images_in_folder('.', 'output_vis', model, transform)
-
+    print("Starting interactive session...")
+    print("A window will open. Click on an image to find similar patches.")
+    interactive_search_session(db, model, transform, top_k=5)
 
 if __name__ == "__main__":
     main()
