@@ -184,7 +184,7 @@ class FeatureDatabase:
             idx += count
         self.features = new_features_list
 
-    def search(self, query_vector, exclude_global_idx=None, top_k=5):
+    def search(self, query_vector, exclude_global_idx=None, exclude_img_idx=None, top_k=5):
         # query_vector: (3,)
         if hasattr(self, 'flattened_features') is False:
             self.build_flattened_index()
@@ -226,6 +226,10 @@ class FeatureDatabase:
                     break
             
             if found_img_idx != -1:
+                # Exclude specific image index (e.g. current query image)
+                if exclude_img_idx is not None and found_img_idx == exclude_img_idx:
+                    continue
+                    
                 img_path = self.image_paths[found_img_idx]
 
                 # Calculate row/col
@@ -403,7 +407,7 @@ def interactive_search_session(db, model, transform, top_k=5):
             start_global_idx, _ = db.global_index_map[current_img_idx]
             query_global_idx = start_global_idx + feature_idx
             
-            results = db.search(target_vector, exclude_global_idx=query_global_idx, top_k=top_k)
+            results = db.search(target_vector, exclude_global_idx=query_global_idx, exclude_img_idx=current_img_idx, top_k=top_k)
             show_results(results, (x, y))
 
     def show_results(results, query_xy):
