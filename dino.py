@@ -228,7 +228,6 @@ class FeatureDatabase:
             if found_img_idx != -1:
                 img_path = self.image_paths[found_img_idx]
 
-
                 # Calculate row/col
                 grid_rows = self.metadata[found_img_idx]['grid_size'][0] 
                 grid_cols = self.metadata[found_img_idx]['grid_size'][1] 
@@ -237,6 +236,11 @@ class FeatureDatabase:
                 col = local_idx % grid_cols
                 
                 patch_box = self.metadata[found_img_idx].get('patch_box')
+
+                # One match per image file constraint
+                # If we already have a result from this image (img_path), skip this candidate
+                if any(res['image_path'] == img_path for res in results):
+                    continue
                 
                 results.append({
                     'image_path': img_path,
