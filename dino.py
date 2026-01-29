@@ -341,7 +341,7 @@ def split_image_with_coords(img, patch_h, patch_w):
         
     return patches, coords
 
-def interactive_search_session(db, model, transform, top_k=5):
+def interactive_search_session(db, model, transform, top_k=5, use_grayscale=False):
     import matplotlib
     try:
         matplotlib.use('Qt5Agg')
@@ -368,7 +368,13 @@ def interactive_search_session(db, model, transform, top_k=5):
         ax_pca.clear()
 
         img_path = db.image_paths[current_img_idx]
-        img = Image.open(img_path).convert('RGB')
+        raw_img = Image.open(img_path)
+        if use_grayscale:
+             raw_img = raw_img.convert('L').convert('RGB')
+        else:
+             raw_img = raw_img.convert('RGB')
+             
+        img = raw_img
         ax_orig.imshow(img)
         ax_orig.set_title(f"Click on a defect! [{current_img_idx+1}/{len(db.image_paths)}] Original\n{os.path.basename(img_path)}")
         ax_orig.axis('off')
@@ -390,7 +396,13 @@ def interactive_search_session(db, model, transform, top_k=5):
         
         patch_box = db.metadata[current_img_idx].get('patch_box')
         # Load full image then crop to patch_box
-        full_img = Image.open(img_path).convert('RGB')
+        # Use same logic for full image re-load
+        full_raw = Image.open(img_path)
+        if use_grayscale:
+            full_img = full_raw.convert('L').convert('RGB')
+        else:
+            full_img = full_raw.convert('RGB')
+            
         # crop
         patch_img = full_img.crop(patch_box)
         
@@ -508,7 +520,12 @@ def interactive_search_session(db, model, transform, top_k=5):
             global_idx = res['global_idx']
             
             # --- Row 0: Original ---
-            full_img = Image.open(r_path).convert('RGB')
+            full_raw = Image.open(r_path)
+            if use_grayscale:
+                full_img = full_raw.convert('L').convert('RGB')
+            else:
+                full_img = full_raw.convert('RGB')
+                
             patch_img = full_img.crop(p_box)
             ax_img.imshow(patch_img)
             ax_img.set_title(f"dist: {r_score:.3f}\n{os.path.basename(r_path)}")
@@ -552,16 +569,22 @@ def interactive_search_session(db, model, transform, top_k=5):
     fig.canvas.mpl_connect('button_press_event', on_click)
     plt.show()
 
-def process_and_build_db(input_folder, model, transform):
+def process_and_build_db(input_folder, model, transform, use_grayscale=False):
     db = FeatureDatabase()
     image_files = glob.glob(os.path.join(input_folder, "*.jpg")) + \
                   glob.glob(os.path.join(input_folder, "*.png"))
     
-    print(f"Building database from {len(image_files)} image files...")
+    print(f"Building database from {len(image_files)} image files... (Grayscale: {use_grayscale})")
     
     for img_path in image_files:
-        img = Image.open(img_path).convert('RGB')
-        patches, coords = split_image_with_coords(img, 640, 640)
+        raw_img = Image.open(img_path)
+        if use_grayscale:
+            # Convert to Grayscale then back to RGB (to replicate channels)
+            raw_img = raw_img.convert('L').convert('RGB')
+        else:
+            raw_img = raw_img.convert('RGB')
+            
+        patches, coords = split_image_with_coords(raw_img, 640, 640)
         
         for i, (patch, box) in enumerate(zip(patches, coords)):
             input_tensor = transform(patch).unsqueeze(0)
@@ -601,12 +624,15 @@ def main():
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
+    # --- Configuration ---
+    USE_GRAYSCALE = True # Set to True to process images in grayscale
+    
     print("Building Database...")
-    db = process_and_build_db('.', model, transform)
+    db = process_and_build_db('.', model, transform, use_grayscale=USE_GRAYSCALE)
         
     print("Starting interactive session...")
     print("A window will open. Click on an image to find similar patches.")
-    interactive_search_session(db, model, transform, top_k=5)
+    interactive_search_session(db, model, transform, top_k=5, use_grayscale=USE_GRAYSCALE)
 
 if __name__ == "__main__":
     main()
