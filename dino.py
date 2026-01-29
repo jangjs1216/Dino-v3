@@ -164,7 +164,7 @@ class FeatureDatabase:
         centered_features = all_features - mean
         
         # Compute PCA using SVD
-        # We want the top 3 principal components
+        # Reverting to use top 3 components (PC1, PC2, PC3) to match init.py visualization.
         try:
             # torch.pca_lowrank is efficient
             U, S, V = torch.pca_lowrank(centered_features, q=3, center=False, niter=2)
@@ -173,6 +173,10 @@ class FeatureDatabase:
         except Exception as e:
             print(f"PCA failed: {e}. Fallback to random projection.")
             self.flattened_features = torch.randn(all_features.shape[0], 3)
+            
+        # Compute Min/Max for Visualization Normalization
+        self.pca_min = self.flattened_features.min(dim=0)[0]
+        self.pca_max = self.flattened_features.max(dim=0)[0]
             
         print(f"Database built: {len(self.image_paths)} images, {self.flattened_features.shape[0]} total patches (3D).")
 
@@ -183,6 +187,44 @@ class FeatureDatabase:
             new_features_list.append(self.flattened_features[idx : idx+count])
             idx += count
         self.features = new_features_list
+
+    def get_pca_map(self, img_idx):
+        # Returns (H, W, 3) numpy array for visualization (uint8)
+        if hasattr(self, 'flattened_features') is False:
+            return None
+            
+        feats = self.features[img_idx] # (N, 3) or (N, 4) depending on PCA setting.
+        # Current logic uses indices 1:4 from PCA if available, stored in self.features
+        
+        # --- Local Min-Max Normalization ---
+        # To match init.py's "colorful" look, we normalize per-image (or per-patch entry)
+        # This enhances contrast within the image, even if global alignment is maintained.
+        # init.py used: (f - f.min()) / (f.max() - f.min()) per patch.
+        
+        f_min = feats.min(dim=0)[0]
+        f_max = feats.max(dim=0)[0]
+        
+        feats_norm = (feats - f_min) / (f_max - f_min + 1e-6)
+        feats_norm = torch.clamp(feats_norm, 0, 1)
+        
+        # Reshape to grid
+        rows, cols = self.metadata[img_idx]['grid_size']
+        # feats is (rows*cols, 3)
+        pca_map = feats_norm.reshape(rows, cols, 3).numpy()
+        pca_map = (pca_map * 255).astype('uint8')
+        return pca_map
+
+    def get_pca_color(self, global_idx):
+        # NOT USED directly in new UI, but helpful to update just in case.
+        # For a single patch, we can't do "local min-max" effectively without context.
+        # We can fall back to global or use the normalization of its parent image.
+        # Let's use global for single-pixel query if needed, 
+        # or better: rely on visualization which uses the map.
+        feat = self.flattened_features[global_idx] # (3,)
+        feat_norm = (feat - self.pca_min) / (self.pca_max - self.pca_min + 1e-6)
+        feat_norm = torch.clamp(feat_norm, 0, 1)
+        color = (feat_norm.numpy() * 255).astype('uint8')
+        return color.reshape(1, 1, 3)
 
     def search(self, query_vector, exclude_global_idx=None, exclude_img_idx=None, top_k=5):
         # query_vector: (3,)
@@ -249,6 +291,7 @@ class FeatureDatabase:
                 results.append({
                     'image_path': img_path,
                     'score': dist,
+                    'global_idx': global_idx,
                     'patch_row': row,
                     'patch_col': col,
                     'grid_size': (grid_rows, grid_cols),
@@ -313,18 +356,22 @@ def interactive_search_session(db, model, transform, top_k=5):
 
     # Helper: Load image and setup plot
     current_img_idx = 0
-    fig, ax = plt.subplots(figsize=(10, 10))
+    # Main Figure: Left = Original, Right = PCA Map
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7))
     plt.subplots_adjust(bottom=0.2)
     
     img_data = {'patches': [], 'coords': [], 'features': None}
     
     def load_current_image():
-        ax.clear()
+        ax_orig, ax_pca = axes[0], axes[1]
+        ax_orig.clear()
+        ax_pca.clear()
+
         img_path = db.image_paths[current_img_idx]
         img = Image.open(img_path).convert('RGB')
-        ax.imshow(img)
-        ax.set_title(f"Click on a defect! [{current_img_idx+1}/{len(db.image_paths)}] {os.path.basename(img_path)}")
-        ax.axis('off')
+        ax_orig.imshow(img)
+        ax_orig.set_title(f"Click on a defect! [{current_img_idx+1}/{len(db.image_paths)}] Original\n{os.path.basename(img_path)}")
+        ax_orig.axis('off')
         
         # We need patch coords and features.
         # DB features are stored by linear index in self.flattened, or by lists in self.features.
@@ -347,10 +394,17 @@ def interactive_search_session(db, model, transform, top_k=5):
         # crop
         patch_img = full_img.crop(patch_box)
         
-        ax.clear()
-        ax.imshow(patch_img)
-        ax.set_title(f"Entry {current_img_idx}: {os.path.basename(img_path)}")
-        ax.axis('off')
+        ax_orig.clear()
+        ax_orig.imshow(patch_img)
+        ax_orig.set_title(f"Entry {current_img_idx} (Orig): {os.path.basename(img_path)}")
+        ax_orig.axis('off')
+
+        # Show PCA Map
+        pca_map = db.get_pca_map(current_img_idx) # (rows, cols, 3)
+        if pca_map is not None:
+            ax_pca.imshow(pca_map, interpolation='nearest') 
+            ax_pca.set_title("PCA Feature Map")
+            ax_pca.axis('off')
 
         img_data['features'] = db.features[current_img_idx] # (1600, 384)
         plt.draw()
@@ -378,23 +432,42 @@ def interactive_search_session(db, model, transform, top_k=5):
     bprev.on_clicked(prev_img)
 
     def on_click(event):
-        if event.inaxes != ax: return
-        x, y = int(event.xdata), int(event.ydata)
-        print(f"Clicked at: {x}, {y}")
+        if event.inaxes not in axes: return
         
-        # Visual Feedback
-        [p.remove() for p in ax.patches if not hasattr(p, 'is_result_box')]
-        ax.plot(x, y, 'rx', markersize=10)
+        x, y = event.xdata, event.ydata
+        if x is None or y is None: return
+        x, y = int(x), int(y)
         
-        # Map pixel to feature index (40x40 grid)
-        # 640 / 40 = 16 pixels per block
-        grid_row = int(y / 16)
-        grid_col = int(x / 16)
+        grid_row, grid_col = 0, 0
         
-        if grid_row >= 40: grid_row = 39
-        if grid_col >= 40: grid_col = 39
+        # Coordinate mapping depends on which axis was clicked
+        if event.inaxes == axes[0]: # Original (640 coords)
+            print(f"Clicked Original at: {x}, {y}")
+            # 1 feature = 16x16 pixels
+            grid_row = int(y / 16)
+            grid_col = int(x / 16)
+            
+            # Visual Feedback on Original
+            [p.remove() for p in axes[0].patches if not hasattr(p, 'is_result_box')]
+            axes[0].plot(x, y, 'rx', markersize=10)
+            
+        elif event.inaxes == axes[1]: # PCA Map (40 coords)
+            print(f"Clicked PCA at: {x}, {y}")
+            # 1 pixel = 1 feature
+            grid_row = y
+            grid_col = x
+            
+            # Visual Feedback on PCA - highlight the pixel
+            # axes[1].plot(x, y, 'rx', markersize=10) # Simple marker
+            
+        # Bounds Check
+        grid_rows, grid_cols = db.metadata[current_img_idx]['grid_size']
+        if grid_row >= grid_rows: grid_row = grid_rows - 1
+        if grid_col >= grid_cols: grid_col = grid_cols - 1
+        if grid_row < 0: grid_row = 0
+        if grid_col < 0: grid_col = 0
         
-        feature_idx = grid_row * 40 + grid_col
+        feature_idx = grid_row * grid_cols + grid_col
         
         target_vector = None
         if feature_idx < img_data['features'].shape[0]:
@@ -416,37 +489,64 @@ def interactive_search_session(db, model, transform, top_k=5):
             return
             
         n_results = len(results)
-        res_fig, res_axes = plt.subplots(1, n_results, figsize=(3 * n_results, 5))
+        # 2 Rows: Top=Original Patch, Bottom=PCA Color/Context
+        res_fig, res_axes = plt.subplots(2, n_results, figsize=(3 * n_results, 6))
         
-        # Handle singleton axis if n_results = 1
+        # Ensure 2D array for indexing convenience
         if n_results == 1:
-            res_axes = [res_axes]
-            
+            res_axes = res_axes.reshape(2, 1)
+        elif len(res_axes.shape) == 1: # Should be (2, N) if N > 1? No, subplots(2, N) returns (2, N)
+             pass 
+             
         for k, res in enumerate(results):
-            ax_k = res_axes[k]
+            ax_img = res_axes[0, k]
+            ax_pca = res_axes[1, k]
             
             r_path = res['image_path']
             r_score = res['score']
-            p_box = res['patch_box'] # (left, top, right, bottom) in original image
+            p_box = res['patch_box'] 
+            global_idx = res['global_idx']
             
+            # --- Row 0: Original ---
             full_img = Image.open(r_path).convert('RGB')
             patch_img = full_img.crop(p_box)
+            ax_img.imshow(patch_img)
+            ax_img.set_title(f"dist: {r_score:.3f}\n{os.path.basename(r_path)}")
+            ax_img.axis('off')
             
-            ax_k.imshow(patch_img)
-            ax_k.set_title(f"{r_score:.3f}\n{os.path.basename(r_path)}")
-            ax_k.axis('off')
-            
-            # Draw Red Box around the specific 16x16 feature block
+            # Draw Box
             r_row = res['patch_row']
             r_col = res['patch_col']
-            
-            # 1 feature = 16x16 pixels
             rect_x = r_col * 16
             rect_y = r_row * 16
-            
             rect = Rectangle((rect_x, rect_y), 16, 16, linewidth=2, edgecolor='red', facecolor='none')
-            ax_k.add_patch(rect)
+            ax_img.add_patch(rect)
             
+            # --- Row 1: PCA Context ---
+            # Find which image (in db) this result is from to get full PCA map
+            found_img_idx = -1
+            # We can't access db.global_index_map directly easily inside this loop if not careful?
+            # actually we can, 'db' is in closure.
+            for i, (start, count) in enumerate(db.global_index_map):
+                if start <= global_idx < start + count:
+                    found_img_idx = i
+                    break
+            
+            if found_img_idx != -1:
+                pca_map_res = db.get_pca_map(found_img_idx) 
+                # This is 40x40
+                ax_pca.imshow(pca_map_res, interpolation='nearest')
+                ax_pca.set_title("PCA Context")
+                ax_pca.axis('off')
+                
+                # Highlight the pixel corresponding to the patch
+                # r_col, r_row are grid coordinates
+                # Plot a cyan dot
+                ax_pca.plot(r_col, r_row, 'c.', markersize=8)
+            else:
+                ax_pca.text(0.5, 0.5, "Error", ha='center')
+
+        res_fig.tight_layout()
         res_fig.show()
 
     fig.canvas.mpl_connect('button_press_event', on_click)
